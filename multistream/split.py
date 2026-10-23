@@ -640,31 +640,25 @@ def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_
             gate_group=(None if shadow_gate is None
                         else _gate_group_fn(shadow_gate, h_full, g0, g1, hd)))
         del h_full
-        recv = ex.all_to_all(rank, [a_all[bounds[p]:bounds[p + 1]] for p in range(ex.n)], dev)
-        del a_all
-        attn_in = torch.cat(recv, dim=-1)
-        del recv
-        x = H._mod_gate(x, gate_msa, blk.attn.out_proj(attn_in), segs)
-        del attn_in
-        h = H._mod_scale_shift(blk.norm2(x), shift_mlp, scale_mlp, segs)
-        return H._mod_gate(x, gate_mlp, blk.mlp(h), segs)
-    qkv = _qkv_group(blk.attn.qkv_proj, h_full, g0, g1, heads, hd)
-    del h_full
-    S = qkv.shape[0]
-    q, k, v = qkv.split(ph * hd, dim=-1)
-    v = v.view(S, ph, hd)
-    q = q.view(1, S, ph, hd)
-    k = k.view(1, S, ph, hd)
-    comfy.quant_ops.ck.rms_rope_split_half_(q, k, rope, qw, kw, epsilon=blk.attn.q_norm.eps,
-                                            rot_dim=rope.shape[-3] * 2)
-    q = A.AttentionTensorContainer(q[0].transpose(0, 1).unsqueeze(0))
-    k = A.AttentionTensorContainer(k[0].transpose(0, 1).unsqueeze(0))
-    v = A.AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-    out = A.optimized_attention(q, k, v, ph, mask=None, skip_reshape=True, transformer_options=to)
-    del q, k, v, qkv
-    a_all = out.squeeze(0)
+    else:
+        qkv = _qkv_group(blk.attn.qkv_proj, h_full, g0, g1, heads, hd)
+        del h_full
+        S = qkv.shape[0]
+        q, k, v = qkv.split(ph * hd, dim=-1)
+        v = v.view(S, ph, hd)
+        q = q.view(1, S, ph, hd)
+        k = k.view(1, S, ph, hd)
+        comfy.quant_ops.ck.rms_rope_split_half_(q, k, rope, qw, kw, epsilon=blk.attn.q_norm.eps,
+                                                rot_dim=rope.shape[-3] * 2)
+        q = A.AttentionTensorContainer(q[0].transpose(0, 1).unsqueeze(0))
+        k = A.AttentionTensorContainer(k[0].transpose(0, 1).unsqueeze(0))
+        v = A.AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+        out = A.optimized_attention(q, k, v, ph, mask=None, skip_reshape=True, transformer_options=to)
+        del q, k, v, qkv
+        a_all = out.squeeze(0)
+        del out
     recv = ex.all_to_all(rank, [a_all[bounds[p]:bounds[p + 1]] for p in range(ex.n)], dev)
-    del a_all, out
+    del a_all
     attn_in = torch.cat(recv, dim=-1)   # head groups in rank order = the model's head order
     del recv
     x = H._mod_gate(x, gate_msa, blk.attn.out_proj(attn_in), segs)
