@@ -10,7 +10,10 @@ has the vbar state stripped, and casts through `shadow_cast` below, which mirror
 path's post-cast (dequant -> lowvram LoRA -> requant) without touching shared state.
 """
 import dataclasses
+import functools
 import threading
+import types
+import weakref
 
 import torch
 
@@ -234,6 +237,22 @@ def staged_size(block):
             total += t.numel() * torch.empty((), dtype=dt).element_size()
     return total
 
+def _rebind_method(k, v, old_self, new_self):
+    if isinstance(v, types.MethodType):
+        s = v.__self__
+        if s is None or s is new_self:
+            return v
+        if isinstance(s, weakref.ProxyTypes):
+            try:
+                proxy_cls = s.__class__
+            except ReferenceError:
+                return v
+            if proxy_cls is not old_self.__class__:
+                return v
+        elif s is not old_self:
+            return v
+        return types.MethodType(v.__func__, weakref.proxy(new_self))
+    return v
 
 def make_shadow(module, rank, cached=None, prefix="", staged=None):
     """Shallow module-tree copy sharing Parameters, with vbar state stripped.
@@ -241,7 +260,7 @@ def make_shadow(module, rank, cached=None, prefix="", staged=None):
     cached: optional {(module_path, param): pinned tensor} for this block (multistream.cache).
     staged: optional {(module_path, param): device tensor} already copied by stage_block (prefetch)."""
     n = module.__class__.__new__(module.__class__)
-    d = {k: v for k, v in module.__dict__.items() if not k.startswith(_STRIP_PREFIXES)}
+    d = {k: _rebind_method(k, v, module, n) for k, v in module.__dict__.items() if not k.startswith(_STRIP_PREFIXES)}
     d["_parameters"] = dict(module._parameters)
     d["_buffers"] = dict(module._buffers)
     d["_modules"] = {k: (make_shadow(c, rank, cached, f"{prefix}.{k}" if prefix else k, staged)

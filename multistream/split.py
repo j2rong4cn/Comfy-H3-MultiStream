@@ -612,8 +612,10 @@ def _qkv_group(lin, h_full, g0, g1, heads, hd):
     """One-shot form for the dense path, which projects the block's tokens exactly once."""
     return _qkv_group_fn(lin, h_full, g0, g1, heads, hd)(h_full)
 
+K_OUT_PROJ = 64.0
+K_FC2 = 256.0
 
-def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_attention=None, vsa=None):
+def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_attention=None, vsa=None, fp16_compute_path=False):
     """One block on one rank. bounds: token range bounds per rank; groups: attention head group bounds per rank."""
     dev = x.device
     heads, hd = blk.attn.heads, blk.attn.head_dim
@@ -621,6 +623,8 @@ def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_
     ph = g1 - g0
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = blk.adaln_proj(t_emb)
     h = H._mod_scale_shift(blk.norm1(x), shift_msa, scale_msa, segs)
+    if fp16_compute_path:
+        h = h.to(torch.float16)
     h_full = ex.all_gather(rank, h, dev)
     del h
     qw = to_device(blk.attn.q_norm.weight, dev)
@@ -661,11 +665,27 @@ def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_
     del a_all
     attn_in = torch.cat(recv, dim=-1)   # head groups in rank order = the model's head order
     del recv
-    x = H._mod_gate(x, gate_msa, blk.attn.out_proj(attn_in), segs)
+    star7_fp16 = bool(to.get("star7_minimax_h3_fp16_exact_fix"))
+    if fp16_compute_path and not star7_fp16:
+        attn_in = attn_in.mul_(1.0 / K_OUT_PROJ).to(torch.float16)
+    out = blk.attn.out_proj(attn_in)
+    if fp16_compute_path and not star7_fp16:
+        out = out.to(torch.float32).mul_(K_OUT_PROJ)
     del attn_in
+    x = H._mod_gate(x, gate_msa, out, segs)
     h = H._mod_scale_shift(blk.norm2(x), shift_mlp, scale_mlp, segs)
+    if fp16_compute_path:
+        h = h.to(torch.float16)
+        if not star7_fp16:
+            return H._mod_gate(x, gate_mlp, fp16_mlp_forward(blk.mlp, h), segs)
     return H._mod_gate(x, gate_mlp, blk.mlp(h), segs)
 
+def fp16_mlp_forward(mlp, tensor):
+    projected = mlp.fc1(tensor.to(torch.float16))
+    gate, up = projected.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate.to(torch.float32)).mul_(up.to(torch.float32))
+    scaled = activated.mul_(1.0 / K_FC2).to(torch.float16)
+    return mlp.fc2(scaled).to(torch.float32).mul_(K_FC2)
 
 def _capture_overrides(user_patches, n_blocks, args, sparse=False, vsa=False):
     """Run wrapper-style block patches against a capturing original_block.
@@ -858,7 +878,7 @@ def release_streams(reason="released on request"):
 
 def run_split_stack(dm, args, user_patches, devices, shares=None, exchange="host", cache_key=None,
                     cache_reserve_gib=0.0, prefetch=None, sparse=False, vsa=False, vram_blocks=False,
-                    vram_reserve_gib=None, exchange_chunks=0):
+                    vram_reserve_gib=None, exchange_chunks=0, fp16_compute_path=False):
     """Run all blocks split across `devices` (rank 0 = the model's device). Ranks may share a GPU (logical-rank tests)."""
     h = args["img"]
     t_emb = args["t_emb"]
@@ -873,6 +893,8 @@ def run_split_stack(dm, args, user_patches, devices, shares=None, exchange="host
     shares = list(shares) if shares else [1.0] * n
     n_blocks = len(dm.blocks)
     heads = dm.blocks[0].attn.heads
+    if fp16_compute_path:
+        h = h.to(torch.float32)
 
     overrides, sparse_at = _capture_overrides(user_patches, n_blocks, args, sparse, vsa)
     ms_cast.install_cast_hook()
@@ -907,6 +929,7 @@ def run_split_stack(dm, args, user_patches, devices, shares=None, exchange="host
         return t.clone() if t.device == dev else to_device(t, dev)
 
     xs = [owned(h[bounds[r]:bounds[r + 1]], devs[r]) for r in range(n)]
+    del h
     t_embs = [owned(t_emb, devs[r]) for r in range(n)]
     ropes = [owned(rope, devs[r]) for r in range(n)]
     seg_parts = [_local_segments(segs, bounds[r], bounds[r + 1], devs[r]) for r in range(n)]
@@ -984,7 +1007,7 @@ def run_split_stack(dm, args, user_patches, devices, shares=None, exchange="host
                             pending[i + 1] = (ahead, done)
                     blk = ms_cast.make_shadow(dm.blocks[i], r, entry, staged=staged)
                     x = _rank_block(r, blk, x, t_embs[r], seg_parts[r], ropes[r], to, ex, bounds, groups,
-                                    sparse_at[i], vsa_ctx)
+                                    sparse_at[i], vsa_ctx, fp16_compute_path)
                     del blk
                     # Lifetime of side-stream memory: this block's MLP kernels may still be queued when _rank_block
                     # returns, so its staged weights stay referenced until the next block has run. The next block's
@@ -1147,13 +1170,13 @@ def make_wrapper(second_gpu_index=None, exchange="host", cache_key=None, cache_r
                      "on" if sparse else "off", "on" if vsa else "off",
                      os.path.basename(cache_key[0]) if cache_key else "off",
                      " | ".join(vram(d) for d in dict.fromkeys(plan.devices)))
-
+        fp16_compute_path = context.dtype is torch.float16
         def first_block(a, extra):
             pause = contextlib.nullcontext() if UNSAFE else comfy.model_prefetch.pause_malloc_graph(sync=True)
             with pause, aimdo_logging_silenced():
                 return {"img": run_split_stack(dm, a, user, plan.devices, plan.shares, exchange, cache_key,
                                                cache_reserve_gib, prefetch, sparse, vsa, vram_blocks,
-                                               vram_reserve_gib, exchange_chunks)}
+                                               vram_reserve_gib, exchange_chunks, fp16_compute_path)}
 
         def identity_block(a, extra):
             return {"img": a["img"]}
