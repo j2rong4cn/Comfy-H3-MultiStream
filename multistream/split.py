@@ -612,7 +612,7 @@ def _qkv_group(lin, h_full, g0, g1, heads, hd):
     """One-shot form for the dense path, which projects the block's tokens exactly once."""
     return _qkv_group_fn(lin, h_full, g0, g1, heads, hd)(h_full)
 
-K_OUT_PROJ = 64.0
+K_ATTN = 64.0
 K_FC2 = 256.0
 
 def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_attention=None, vsa=None, fp16_compute_path=False):
@@ -624,7 +624,7 @@ def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = blk.adaln_proj(t_emb)
     h = H._mod_scale_shift(blk.norm1(x), shift_msa, scale_msa, segs)
     if fp16_compute_path:
-        h = h.to(torch.float16)
+        h = h.mul_(1.0 / K_ATTN).to(torch.float16)
     h_full = ex.all_gather(rank, h, dev)
     del h
     qw = to_device(blk.attn.q_norm.weight, dev)
@@ -665,23 +665,23 @@ def _rank_block(rank, blk, x, t_emb, segs, rope, to, ex, bounds, groups, sparse_
     del a_all
     attn_in = torch.cat(recv, dim=-1)   # head groups in rank order = the model's head order
     del recv
-    star7_fp16 = bool(to.get("star7_minimax_h3_fp16_exact_fix"))
-    if fp16_compute_path and not star7_fp16:
-        attn_in = attn_in.mul_(1.0 / K_OUT_PROJ).to(torch.float16)
+    if fp16_compute_path:
+        attn_in = attn_in.to(torch.float16)
     out = blk.attn.out_proj(attn_in)
-    if fp16_compute_path and not star7_fp16:
-        out = out.to(torch.float32).mul_(K_OUT_PROJ)
+    if fp16_compute_path:
+        out = out.to(torch.float32).mul_(K_ATTN)
     del attn_in
     x = H._mod_gate(x, gate_msa, out, segs)
     h = H._mod_scale_shift(blk.norm2(x), shift_mlp, scale_mlp, segs)
     if fp16_compute_path:
         h = h.to(torch.float16)
+        star7_fp16 = bool(to.get("star7_minimax_h3_fp16_exact_fix"))
         if not star7_fp16:
             return H._mod_gate(x, gate_mlp, fp16_mlp_forward(blk.mlp, h), segs)
     return H._mod_gate(x, gate_mlp, blk.mlp(h), segs)
 
 def fp16_mlp_forward(mlp, tensor):
-    projected = mlp.fc1(tensor.to(torch.float16))
+    projected = mlp.fc1(tensor)
     gate, up = projected.chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate.to(torch.float32)).mul_(up.to(torch.float32))
     scaled = activated.mul_(1.0 / K_FC2).to(torch.float16)
