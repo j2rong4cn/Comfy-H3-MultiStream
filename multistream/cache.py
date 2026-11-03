@@ -15,6 +15,12 @@ What it is:
   * filled lazily per block (per-block lock) plus a background prefill thread;
   * one checkpoint at a time: acquiring a different key evicts the others; a RAM guard refuses to fill when
     fewer than RESERVE_GIB would remain available.
+
+File fallback (H3MS_WEIGHT_CACHE_DIR): when RAM is short, a block is served from a local safetensors file instead
+of streaming from the checkpoint again. For a LAN checkpoint this turns "network mmap on every step" into
+"one network read, then local page cache" -- network jitter stops affecting sampling after the first step.
+Files are keyed by the same checkpoint identity, so a new checkpoint never reuses stale blocks. Files are
+never deleted implicitly; `cleanup_files=True` on release, or `cache.cleanup_files()`, removes them.
 """
 import contextlib
 import dataclasses
@@ -90,8 +96,77 @@ def _host_params(block):
             yield name, p, t
 
 
+# ---- file-cache serialization --------------------------------------------------------------
+# A QuantizedTensor carries a qdata tensor plus _params, whose fields may themselves be tensors
+# (scales, zero-points, ...) or scalars (layout flags). safetensors only stores tensors, so each
+# tensor rides under its own key and the layout class plus any non-tensor field is recorded in a
+# sibling .json. On load the block's own _params supplies the field names, so no schema is
+# needed for the tensor slots beyond the ones we wrote.
+
+_QDATA_SUFFIX = ".__qdata__"
+_PARAM_SUFFIX = ".__p_"
+
+
+def _save_block_file(block, path):
+    import json
+    import safetensors.torch as st
+
+    tensors = {}
+    layouts = {}
+    for name, p, t in _host_params(block):
+        base = f"{name}.{p}"
+        if isinstance(t, QuantizedTensor):
+            layouts[base] = t._layout_cls
+            tensors[base + _QDATA_SUFFIX] = t._qdata.detach().contiguous().clone()
+            for f in dataclasses.fields(t._params):
+                v = getattr(t._params, f.name)
+                if isinstance(v, torch.Tensor):
+                    tensors[base + _PARAM_SUFFIX + f.name + "__"] = v.detach().contiguous().clone()
+        else:
+            tensors[base] = t.detach().contiguous().clone()
+
+    tmp = path + ".tmp"
+    meta_tmp = path + ".json.tmp"
+    st.save_file(tensors, tmp)
+    with open(meta_tmp, "w") as fh:
+        json.dump({"layouts": layouts}, fh)
+    # Two replaces: a reader only accepts the pair when both exist, so a crash between them is
+    # detected and the block is re-written instead of loading a half-file.
+    os.replace(tmp, path)
+    os.replace(meta_tmp, path + ".json")
+
+
+def _load_block_file(path, block):
+    import json
+    import safetensors.torch as st
+
+    with open(path + ".json") as fh:
+        meta = json.load(fh)
+    layouts = meta.get("layouts", {})
+
+    entries = {}
+    with st.safe_open(path, framework="pt", device="cpu") as fh:
+        keys = set(fh.keys())
+        for name, p, orig in _host_params(block):
+            base = f"{name}.{p}"
+            if isinstance(orig, QuantizedTensor) and base in layouts:
+                qdata = fh.get_tensor(base + _QDATA_SUFFIX)
+                repl = {}
+                for f in dataclasses.fields(orig._params):
+                    tkey = base + _PARAM_SUFFIX + f.name + "__"
+                    if tkey in keys:
+                        repl[f.name] = fh.get_tensor(tkey)
+                # Non-tensor fields keep the value from the block's own _params: they are
+                # construction parameters (layout flags) and do not vary between runs.
+                entries[(name, p)] = QuantizedTensor(
+                    qdata, layouts[base], dataclasses.replace(orig._params, **repl))
+            elif base in keys:
+                entries[(name, p)] = fh.get_tensor(base)
+    return entries
+
+
 class WeightCache:
-    def __init__(self, key, reserve_gib=DEFAULT_RESERVE_GIB):
+    def __init__(self, key, reserve_gib=DEFAULT_RESERVE_GIB, file_dir=None):
         self.key = key
         self.reserve_gib = float(reserve_gib)
         self.blocks = {}
@@ -104,6 +179,19 @@ class WeightCache:
         self._closed = False
         self._users = 0
         self._idle = threading.Condition()
+        self._set_file_dir(file_dir)
+
+    def _set_file_dir(self, file_dir):
+        self.file_bytes = 0
+        self.file_dir = file_dir
+        if file_dir is None:
+            self._file_key = None
+            return
+        os.makedirs(file_dir, exist_ok=True)
+        # Hash of the full key (group, path, size, mtime, options): a new checkpoint or a
+        # different model option gets a different prefix, so stale files never load.
+        import hashlib
+        self._file_key = hashlib.sha256(repr(self.key).encode()).hexdigest()[:16]
 
     @contextlib.contextmanager
     def in_use(self):
@@ -127,6 +215,58 @@ class WeightCache:
                 if self._users == 0:
                     self._idle.notify_all()
 
+    def _file_path(self, idx):
+        if self._file_key is None:
+            return None
+        return os.path.join(self.file_dir, f"{self._file_key}_block_{idx:04d}.safetensors")
+
+    def _load_or_build_file(self, idx, block):
+        """Return the block's entries from a local file, building it from the checkpoint if missing.
+
+        Called under self._block_locks[idx], so two ranks cannot race on the same block's file.
+        Errors downgrade to None (caller falls back to the checkpoint) rather than raising.
+        """
+        path = self._file_path(idx)
+        if path is None:
+            return None
+        if os.path.isfile(path) and os.path.isfile(path + ".json"):
+            try:
+                entry = _load_block_file(path, block)
+                self.file_bytes += sum(_nbytes(t) for t in entry.values())
+                return entry
+            except Exception:
+                log.exception("[Cache] %s block %d file unreadable, deleting %s",
+                              self.key[0], idx, path)
+                for p in (path, path + ".json"):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        try:
+            need = sum(_nbytes(t) for _, _, t in _host_params(block))
+            import shutil
+            free = shutil.disk_usage(self.file_dir).free
+            if free < need + 512 * 2**20:
+                log.warning("[Cache] %s block %d file cache skipped: only %s free on %s",
+                            self.key[0], idx, gib(free), self.file_dir)
+                return None
+        except Exception:
+            pass
+        try:
+            _save_block_file(block, path)
+        except Exception:
+            log.exception("[Cache] %s block %d file write failed", self.key[0], idx)
+            return None
+        try:
+            entry = _load_block_file(path, block)
+        except Exception:
+            log.exception("[Cache] %s block %d file reload failed", self.key[0], idx)
+            return None
+        written = sum(_nbytes(t) for t in entry.values())
+        self.file_bytes += written
+        log.info("[Cache] %s block %d written to %s (%s)", self.key[0], idx, path, gib(written))
+        return entry
+
     def get_block(self, idx, block):
         entry = self.blocks.get(idx)
         if entry is not None or self.disabled:
@@ -140,6 +280,12 @@ class WeightCache:
             avail = ram_available()[0]
             reserve = max(self.reserve_gib, MIN_HEADROOM_GIB)
             if avail - need < reserve * _GIB:
+                # RAM short: a local file costs a disk read, the checkpoint costs a network read.
+                if self.file_dir is not None:
+                    entry = self._load_or_build_file(idx, block)
+                    if entry is not None:
+                        self.blocks[idx] = entry
+                        return entry
                 self.disabled = True
                 log.warning("[Cache] %s weight cache DISABLED: block %d needs %s, only %.1f GiB available "
                             "(keeping %.1f GiB free) -> streaming without cache | %s", self.key[0], idx, gib(need),
@@ -180,10 +326,30 @@ class WeightCache:
         self._prefill = threading.Thread(target=run, name="h3ms-cache-prefill", daemon=True)
         self._prefill.start()
 
+    def cleanup_files(self):
+        """Remove every file this cache wrote. Safe to call after close() or with the cache live;
+        a running get_block that is rewriting a file would simply rewrite it on the next miss."""
+        if self._file_key is None or not os.path.isdir(self.file_dir):
+            return 0
+        prefix = self._file_key + "_block_"
+        removed = 0
+        for name in os.listdir(self.file_dir):
+            if not name.startswith(prefix):
+                continue
+            try:
+                os.remove(os.path.join(self.file_dir, name))
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            log.info("[Cache] removed %d cached block file(s) for %s", removed, self.key[0])
+        return removed
+
     def close(self, wait_seconds=600):
         """Unregister and drop every pinned tensor. Waits for in-flight readers (see in_use); returns False
         and keeps the cache pinned if they do not finish, because unregistering under them would be unsafe."""
-        log.info("[Cache] releasing %s weight cache %s: %s", self.key[0], os.path.basename(self.key[1]), gib(self.bytes))
+        log.info("[Cache] releasing %s weight cache %s: %s pinned, %s on disk",
+                 self.key[0], os.path.basename(self.key[1]), gib(self.bytes), gib(self.file_bytes))
         with self._idle:
             self._closed = True   # no new readers from here on
             if not self._idle.wait_for(lambda: self._users == 0, timeout=wait_seconds):
@@ -203,11 +369,14 @@ class WeightCache:
         self._keep.clear()
         self.blocks.clear()
         self.bytes = 0
+        self.file_bytes = 0
         return True
 
     def stats(self):
         return {"group": self.key[0].split(":", 1)[0], "file": os.path.basename(self.key[1]),
-                "key": list(self.key), "blocks": len(self.blocks), "GiB": round(self.bytes / _GIB, 3),
+                "key": list(self.key), "blocks": len(self.blocks),
+                "GiB": round(self.bytes / _GIB, 3), "file_GiB": round(self.file_bytes / _GIB, 3),
+                "file_dir": self.file_dir,
                 "fill_seconds": round(self.fill_seconds, 1), "disabled": self.disabled,
                 "reserve_GiB": self.reserve_gib}
 
@@ -234,10 +403,14 @@ def acquire(base_key, reserve_gib=DEFAULT_RESERVE_GIB, group="dit"):
                 if not _CACHES[other].close():
                     continue   # readers still on it; leave it registered and let the next acquire retry
                 _CACHES.pop(other)
-            cache = WeightCache(key, reserve_gib)
+            file_dir = os.environ.get("H3MS_WEIGHT_CACHE_DIR", "")
+            if file_dir == "":
+                file_dir = None
+            cache = WeightCache(key, reserve_gib, file_dir=file_dir)
             _CACHES[key] = cache
-            log.info("[Cache] new %s weight cache for %s (reserve %.1f GiB) | %s", group.split(":", 1)[0],
-                     os.path.basename(key[1]), float(reserve_gib), ram())
+            log.info("[Cache] new %s weight cache for %s (reserve %.1f GiB, file_dir %s) | %s",
+                     group.split(":", 1)[0], os.path.basename(key[1]), float(reserve_gib),
+                     file_dir or "-", ram())
         else:
             if cache.disabled and float(reserve_gib) < cache.reserve_gib:
                 cache.disabled = False  # a lower reserve re-enables filling
@@ -249,12 +422,14 @@ def _group_of(key):
     return key[0].split(":", 1)[0]
 
 
-def release(group, reason=""):
+def release(group, reason="", cleanup_files=False):
     """Close every cache in `group` ("te", "dit", "vae" -- the VAE's per-file "vae:<path>" groups all match "vae").
 
     This is what turning a node's `weight_cache` off calls. Before this existed, switching it off only stopped
     the cache being used and refilled: the WeightCache stayed in _CACHES with every cudaHostRegister'd page
     still pinned, so the RAM never came back and, being pinned, could not even be swapped.
+
+    cleanup_files=True additionally removes the local block files this cache wrote.
     """
     freed, kept = 0, 0
     with _LOCK:
@@ -264,6 +439,8 @@ def release(group, reason=""):
             if cache.close():
                 _CACHES.pop(key)
                 freed += n
+                if cleanup_files:
+                    cache.cleanup_files()
             else:
                 kept += n
     if freed or kept:
@@ -273,10 +450,11 @@ def release(group, reason=""):
     return freed
 
 
-def release_async(group, reason=""):
+def release_async(group, reason="", cleanup_files=False):
     """release() off the calling thread. install() runs inside prompt execution, where a reader may hold the
     cache for the length of a sampler step; blocking the node there would stall the prompt."""
-    t = threading.Thread(target=release, args=(group, reason), name=f"h3ms-cache-release-{group}", daemon=True)
+    t = threading.Thread(target=release, args=(group, reason, cleanup_files),
+                         name=f"h3ms-cache-release-{group}", daemon=True)
     t.start()
     return t
 
